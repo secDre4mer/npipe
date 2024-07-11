@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net"
 
-	"gopkg.in/natefinch/npipe.v2"
+	"github.com/secDre4mer/npipe"
 )
 
 // Use Dial to connect to a server and read messages from it.
