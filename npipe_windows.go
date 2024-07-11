@@ -71,7 +71,7 @@ var _ net.Listener = (*PipeListener)(nil)
 
 // ErrClosed is the error returned by PipeListener.Accept when Close is called
 // on the PipeListener.
-var ErrClosed = PipeError{"Pipe has been closed.", false}
+var ErrClosed = net.ErrClosed
 
 // PipeError is an error related to a call to a pipe
 type PipeError struct {
