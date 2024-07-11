@@ -9,6 +9,7 @@ package npipe
 // sys cancelIoEx(handle syscall.Handle, overlapped *syscall.Overlapped) (err error) = CancelIoEx
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -125,35 +126,33 @@ func Dial(address string) (*PipeConn, error) {
 
 // DialTimeout acts like Dial, but will time out after the duration of timeout
 func DialTimeout(address string, timeout time.Duration) (*PipeConn, error) {
-	deadline := time.Now().Add(timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return DialContext(ctx, address)
+}
 
-	now := time.Now()
-	for now.Before(deadline) {
-		millis := uint32(deadline.Sub(now) / time.Millisecond)
-		conn, err := dial(address, millis)
+// DialContext acts like Dial, but will cancel on context expiration
+func DialContext(ctx context.Context, address string) (*PipeConn, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := dial(address, 50)
 		if err == nil {
 			return conn, nil
 		}
 		if err == error_sem_timeout {
-			// This is WaitNamedPipe's timeout error, so we know we're done
-			return nil, PipeError{fmt.Sprintf(
-				"Timed out waiting for pipe '%s' to come available", address), true}
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if isPipeNotReady(err) {
-			left := deadline.Sub(time.Now())
-			retry := 100 * time.Millisecond
-			if left > retry {
-				<-time.After(retry)
-			} else {
-				<-time.After(left - time.Millisecond)
-			}
-			now = time.Now()
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		return nil, err
 	}
-	return nil, PipeError{fmt.Sprintf(
-		"Timed out waiting for pipe '%s' to come available", address), true}
 }
 
 // isPipeNotReady checks the error to see if it indicates the pipe is not ready
