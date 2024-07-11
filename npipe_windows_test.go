@@ -261,7 +261,7 @@ func TestReadDeadline(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	go listenAndWait(address, wg, t)
+	go listenAndWait(address, &wg, t)
 	defer wg.Done()
 
 	c, err := Dial(address)
@@ -295,7 +295,7 @@ func TestReadDeadline(t *testing.T) {
 
 // listenAndWait simply sets up a pipe listener that does nothing and closes after the waitgroup
 // is done.
-func listenAndWait(address string, wg sync.WaitGroup, t *testing.T) {
+func listenAndWait(address string, wg *sync.WaitGroup, t *testing.T) {
 	ln, err := Listen(address)
 	if err != nil {
 		t.Fatalf("Error starting to listen on pipe: %v", err)
@@ -321,7 +321,7 @@ func TestWriteDeadline(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	go listenAndWait(address, wg, t)
+	go listenAndWait(address, &wg, t)
 	defer wg.Done()
 	c, err := Dial(address)
 	if err != nil {
