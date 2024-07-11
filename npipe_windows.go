@@ -178,13 +178,19 @@ func newOverlapped() (*syscall.Overlapped, error) {
 // waitForCompletion waits for an asynchronous I/O request referred to by overlapped to complete.
 // This function returns the number of bytes transferred by the operation and an error code if
 // applicable (nil otherwise).
-func waitForCompletion(handle syscall.Handle, overlapped *syscall.Overlapped) (uint32, error) {
+func waitForCompletion(withHandle func(func(h syscall.Handle)), overlapped *syscall.Overlapped) (uint32, error) {
 	_, err := syscall.WaitForSingleObject(overlapped.HEvent, syscall.INFINITE)
 	if err != nil {
 		return 0, err
 	}
 	var transferred uint32
-	err = getOverlappedResult(handle, overlapped, &transferred, true)
+	withHandle(func(handle syscall.Handle) {
+		if handle == 0 { // Connection was closed while we were waiting for completion
+			err = net.ErrClosed
+			return
+		}
+		err = getOverlappedResult(handle, overlapped, &transferred, true)
+	})
 	return transferred, err
 }
 
@@ -314,26 +320,30 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 	if err == error_io_incomplete || err == syscall.ERROR_IO_PENDING {
 		l.acceptOverlapped = overlapped
 		l.acceptHandle = handle
-		// unlock here so close can function correctly while we wait (we'll
-		// get relocked via the defer below, before the original defer
-		// unlock happens.)
+		// unlock here so close can function correctly while we wait,
+		// then relock afterwards to ensure we don't race with close after the wait.
+		// Since this function is responsible for the handle, we do not need to worry about it being closed
+		// while we don't have the lock.
 		l.mu.Unlock()
-		defer func() {
-			l.mu.Lock()
-			l.acceptOverlapped = nil
-			l.acceptHandle = 0
-			// unlock is via defer above.
-		}()
-		_, err = waitForCompletion(handle, overlapped)
-	}
-	if err == syscall.ERROR_OPERATION_ABORTED {
-		// Return error compatible to net.Listener.Accept() in case the
-		// listener was closed.
-		return nil, ErrClosed
+		_, err = waitForCompletion(func(f func(h syscall.Handle)) {
+			f(handle)
+		}, overlapped)
+		l.mu.Lock()
+		// If we're here, the wait is done, so we can clear the overlapped and handle
+		l.acceptOverlapped = nil
+		l.acceptHandle = 0
 	}
 	if err != nil {
+		// Ensure we close the handle if we failed to accept the connection
+		_ = syscall.CloseHandle(handle)
+		if err == syscall.ERROR_OPERATION_ABORTED {
+			// Return error compatible to net.Listener.Accept() in case the
+			// listener was closed.
+			return nil, net.ErrClosed
+		}
 		return nil, err
 	}
+	// We forward the handle to the caller as a PipeConn. The caller is now responsible for closing it when done.
 	return &PipeConn{handle: handle, addr: l.addr}, nil
 }
 
@@ -361,19 +371,10 @@ func (l *PipeListener) Close() error {
 	if l.acceptOverlapped != nil && l.acceptHandle != 0 {
 		// Cancel the pending IO. This call does not block, so it is safe
 		// to hold onto the mutex above.
+		// AcceptPipe is responsible for closing the handles of the pending IO, we don't need to do it here.
 		if err := cancelIoEx(l.acceptHandle, l.acceptOverlapped); err != nil {
 			return err
 		}
-		err := syscall.CloseHandle(l.acceptOverlapped.HEvent)
-		if err != nil {
-			return err
-		}
-		l.acceptOverlapped.HEvent = 0
-		err = syscall.CloseHandle(l.acceptHandle)
-		if err != nil {
-			return err
-		}
-		l.acceptHandle = 0
 	}
 	return nil
 }
@@ -384,9 +385,13 @@ func (l *PipeListener) Addr() net.Addr { return l.addr }
 // PipeConn is the implementation of the net.Conn interface for named pipe connections.
 type PipeConn struct {
 	handle syscall.Handle
-	addr   PipeAddr
+	// handleMutex controls access to the pipe handle.
+	// Read / Write operations may only be performed when the mutex is locked.
+	// The mutex must be unlocked when waiting for an asynchronous operation to complete.
+	handleMutex sync.RWMutex
 
-	// these aren't actually used yet
+	addr PipeAddr
+
 	readDeadline  *time.Time
 	writeDeadline *time.Time
 }
@@ -409,13 +414,21 @@ func (c *PipeConn) completeRequest(data iodata, deadline *time.Time, overlapped 
 		}
 		done := make(chan iodata)
 		go func() {
-			n, err := waitForCompletion(c.handle, overlapped)
+			n, err := waitForCompletion(c.withHandle, overlapped)
 			done <- iodata{n, err}
 		}()
 		select {
 		case data = <-done:
 		case <-timer:
-			syscall.CancelIoEx(c.handle, overlapped)
+			c.withHandle(func(handle syscall.Handle) {
+				// It is possible that the connection was already closed and
+				// handle is therefore 0.
+				// However, closing the connection also cancels the connection, so we don't need to act.
+				if handle == 0 {
+					return
+				}
+				syscall.CancelIoEx(handle, overlapped)
+			})
 			data = iodata{0, timeout(c.addr.String())}
 		}
 	}
@@ -428,6 +441,12 @@ func (c *PipeConn) completeRequest(data iodata, deadline *time.Time, overlapped 
 	return int(data.n), data.err
 }
 
+func (c *PipeConn) withHandle(f func(handle syscall.Handle)) {
+	c.handleMutex.RLock()
+	defer c.handleMutex.RUnlock()
+	f(c.handle)
+}
+
 // Read implements the net.Conn Read method.
 func (c *PipeConn) Read(b []byte) (int, error) {
 	// Use ReadFile() rather than Read() because the latter
@@ -438,7 +457,13 @@ func (c *PipeConn) Read(b []byte) (int, error) {
 	}
 	defer syscall.CloseHandle(overlapped.HEvent)
 	var n uint32
-	err = syscall.ReadFile(c.handle, b, &n, overlapped)
+	c.withHandle(func(handle syscall.Handle) {
+		if handle == 0 {
+			err = net.ErrClosed
+			return
+		}
+		err = syscall.ReadFile(handle, b, &n, overlapped)
+	})
 	return c.completeRequest(iodata{n, err}, c.readDeadline, overlapped)
 }
 
@@ -450,13 +475,29 @@ func (c *PipeConn) Write(b []byte) (int, error) {
 	}
 	defer syscall.CloseHandle(overlapped.HEvent)
 	var n uint32
-	err = syscall.WriteFile(c.handle, b, &n, overlapped)
+	c.withHandle(func(handle syscall.Handle) {
+		if handle == 0 {
+			err = net.ErrClosed
+			return
+		}
+		err = syscall.WriteFile(handle, b, &n, overlapped)
+	})
 	return c.completeRequest(iodata{n, err}, c.writeDeadline, overlapped)
 }
 
 // Close closes the connection.
 func (c *PipeConn) Close() error {
-	return syscall.CloseHandle(c.handle)
+	// Get an exclusive lock on the handle to ensure that no other operations use it right now
+	c.handleMutex.Lock()
+	defer c.handleMutex.Unlock()
+	// If the handle is already 0, the connection was already closed
+	if c.handle == 0 {
+		return nil
+	}
+	err := syscall.CloseHandle(c.handle)
+	// Set the handle to 0 to indicate that the connection is closed
+	c.handle = 0
+	return err
 }
 
 // LocalAddr returns the local network address.
