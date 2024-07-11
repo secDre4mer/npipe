@@ -145,7 +145,10 @@ func TestListenCloseListen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen(%q): %v", address, err)
 	}
-	ln1.Close()
+	err = ln1.Close()
+	if err != nil {
+		t.Fatalf("Close(%q): %v", address, err)
+	}
 
 	ln2, err := Listen(address)
 	if err != nil {
@@ -154,9 +157,13 @@ func TestListenCloseListen(t *testing.T) {
 	ln2.Close()
 }
 
-// TestCloseFileHandles tests that all PipeListener handles are actualy closed after
+// TestCloseFileHandles tests that all PipeListener handles are actually closed after
 // calling Close()
 func TestCloseFileHandles(t *testing.T) {
+	trackHandles = true
+	defer func() {
+		trackHandles = false
+	}()
 	address := `\\.\pipe\TestCloseFileHandles`
 	ln, err := Listen(address)
 	if err != nil {
@@ -166,7 +173,11 @@ func TestCloseFileHandles(t *testing.T) {
 	server := rpc.NewServer()
 	service := &RPCService{}
 	server.Register(service)
+	var acceptWg sync.WaitGroup
+	acceptWg.Add(1)
 	go func() {
+		defer acceptWg.Done()
+		var serveConnWg sync.WaitGroup
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -176,15 +187,19 @@ func TestCloseFileHandles(t *testing.T) {
 				}
 				break
 			}
-			go server.ServeConn(conn)
+			serveConnWg.Add(1)
+			go func() {
+				defer serveConnWg.Done()
+				server.ServeConn(conn)
+			}()
 		}
+		serveConnWg.Wait()
 	}()
 	conn, err := Dial(address)
 	if err != nil {
 		t.Fatalf("Error dialing %q: %v", address, err)
 	}
 	client := rpc.NewClient(conn)
-	defer client.Close()
 	req := "dummy"
 	resp := ""
 	if err = client.Call("RPCService.GetResponse", req, &resp); err != nil {
@@ -193,13 +208,12 @@ func TestCloseFileHandles(t *testing.T) {
 	if req != resp {
 		t.Fatalf("Unexpected result (expected: %q, got: %q)", req, resp)
 	}
+	client.Close()
 	ln.Close()
+	acceptWg.Wait()
 
-	if ln.acceptHandle != 0 {
-		t.Fatalf("Failed to close acceptHandle")
-	}
-	if ln.acceptOverlapped.HEvent != 0 {
-		t.Fatalf("Failed to close acceptOverlapped handle")
+	if len(openHandles) != 0 {
+		t.Fatalf("Failed to close all handles")
 	}
 }
 

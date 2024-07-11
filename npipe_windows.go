@@ -173,6 +173,11 @@ func newOverlapped() (*syscall.Overlapped, error) {
 	if err != nil {
 		return nil, err
 	}
+	if trackHandles {
+		openHandlesMutex.Lock()
+		openHandles[event] = struct{}{}
+		openHandlesMutex.Unlock()
+	}
 	return &syscall.Overlapped{HEvent: event}, nil
 }
 
@@ -224,6 +229,11 @@ func dial(address string, timeout uint32) (*PipeConn, error) {
 		syscall.FILE_FLAG_OVERLAPPED, 0)
 	if err != nil {
 		return nil, err
+	}
+	if trackHandles {
+		openHandlesMutex.Lock()
+		openHandles[handle] = struct{}{}
+		openHandlesMutex.Unlock()
 	}
 	return &PipeConn{handle: handle, addr: PipeAddr(address)}, nil
 }
@@ -312,7 +322,7 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer syscall.CloseHandle(overlapped.HEvent)
+	defer closeHandle(overlapped.HEvent)
 	err = connectNamedPipe(handle, overlapped)
 	if err == nil || err == error_pipe_connected {
 		return &PipeConn{handle: handle, addr: l.addr}, nil
@@ -336,7 +346,7 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 	}
 	if err != nil {
 		// Ensure we close the handle if we failed to accept the connection
-		_ = syscall.CloseHandle(handle)
+		_ = closeHandle(handle)
 		if err == syscall.ERROR_OPERATION_ABORTED {
 			// Return error compatible to net.Listener.Accept() in case the
 			// listener was closed.
@@ -363,7 +373,7 @@ func (l *PipeListener) Close() error {
 		if err != nil {
 			return err
 		}
-		err = syscall.CloseHandle(l.handle)
+		err = closeHandle(l.handle)
 		if err != nil {
 			return err
 		}
@@ -456,7 +466,7 @@ func (c *PipeConn) Read(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer syscall.CloseHandle(overlapped.HEvent)
+	defer closeHandle(overlapped.HEvent)
 	var n uint32
 	c.withHandle(func(handle syscall.Handle) {
 		if handle == 0 {
@@ -474,7 +484,7 @@ func (c *PipeConn) Write(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer syscall.CloseHandle(overlapped.HEvent)
+	defer closeHandle(overlapped.HEvent)
 	var n uint32
 	c.withHandle(func(handle syscall.Handle) {
 		if handle == 0 {
@@ -495,7 +505,7 @@ func (c *PipeConn) Close() error {
 	if c.handle == 0 {
 		return nil
 	}
-	err := syscall.CloseHandle(c.handle)
+	err := closeHandle(c.handle)
 	// Set the handle to 0 to indicate that the connection is closed
 	c.handle = 0
 	return err
@@ -558,12 +568,40 @@ func createPipe(address string, first bool) (syscall.Handle, error) {
 	if first {
 		mode |= file_flag_first_pipe_instance
 	}
-	return createNamedPipe(n,
+	handle, err := createNamedPipe(n,
 		mode,
 		pipe_type_byte,
 		pipe_unlimited_instances,
 		512, 512, 0, nil)
+	if err != nil {
+		return 0, err
+	}
+	if trackHandles {
+		openHandlesMutex.Lock()
+		openHandles[handle] = struct{}{}
+		openHandlesMutex.Unlock()
+	}
+	return handle, nil
 }
+
+func closeHandle(handle syscall.Handle) error {
+	if trackHandles {
+		openHandlesMutex.Lock()
+		if _, ok := openHandles[handle]; !ok {
+			panic(fmt.Sprintf("Closing an unknown handle: %v", handle))
+		}
+		delete(openHandles, handle)
+		openHandlesMutex.Unlock()
+	}
+	return syscall.CloseHandle(handle)
+}
+
+var (
+	// Unit test helpers to ensure that we're not leaking handles
+	trackHandles     bool
+	openHandles      = make(map[syscall.Handle]struct{})
+	openHandlesMutex sync.Mutex
+)
 
 func badAddr(addr string) PipeError {
 	return PipeError{fmt.Sprintf("Invalid pipe address '%s'.", addr), false}
