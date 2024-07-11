@@ -1,12 +1,12 @@
 package npipe
 
-//sys createNamedPipe(name *uint16, openMode uint32, pipeMode uint32, maxInstances uint32, outBufSize uint32, inBufSize uint32, defaultTimeout uint32, sa *syscall.SecurityAttributes) (handle syscall.Handle, err error)  [failretval==syscall.InvalidHandle] = CreateNamedPipeW
-//sys connectNamedPipe(handle syscall.Handle, overlapped *syscall.Overlapped) (err error) = ConnectNamedPipe
-//sys disconnectNamedPipe(handle syscall.Handle) (err error) = DisconnectNamedPipe
-//sys waitNamedPipe(name *uint16, timeout uint32) (err error) = WaitNamedPipeW
-//sys createEvent(sa *syscall.SecurityAttributes, manualReset bool, initialState bool, name *uint16) (handle syscall.Handle, err error) [failretval==syscall.InvalidHandle] = CreateEventW
-//sys getOverlappedResult(handle syscall.Handle, overlapped *syscall.Overlapped, transferred *uint32, wait bool) (err error) = GetOverlappedResult
-//sys cancelIoEx(handle syscall.Handle, overlapped *syscall.Overlapped) (err error) = CancelIoEx
+// sys createNamedPipe(name *uint16, openMode uint32, pipeMode uint32, maxInstances uint32, outBufSize uint32, inBufSize uint32, defaultTimeout uint32, sa *syscall.SecurityAttributes) (handle syscall.Handle, err error)  [failretval==syscall.InvalidHandle] = CreateNamedPipeW
+// sys connectNamedPipe(handle syscall.Handle, overlapped *syscall.Overlapped) (err error) = ConnectNamedPipe
+// sys disconnectNamedPipe(handle syscall.Handle) (err error) = DisconnectNamedPipe
+// sys waitNamedPipe(name *uint16, timeout uint32) (err error) = WaitNamedPipeW
+// sys createEvent(sa *syscall.SecurityAttributes, manualReset bool, initialState bool, name *uint16) (handle syscall.Handle, err error) [failretval==syscall.InvalidHandle] = CreateEventW
+// sys getOverlappedResult(handle syscall.Handle, overlapped *syscall.Overlapped, transferred *uint32, wait bool) (err error) = GetOverlappedResult
+// sys cancelIoEx(handle syscall.Handle, overlapped *syscall.Overlapped) (err error) = CancelIoEx
 
 import (
 	"fmt"
@@ -103,11 +103,12 @@ func (e PipeError) Temporary() bool {
 // Dial will return a PipeError if you pass in a badly formatted pipe name.
 //
 // Examples:
-//   // local pipe
-//   conn, err := Dial(`\\.\pipe\mypipename`)
 //
-//   // remote pipe
-//   conn, err := Dial(`\\othercomp\pipe\mypipename`)
+//	// local pipe
+//	conn, err := Dial(`\\.\pipe\mypipename`)
+//
+//	// remote pipe
+//	conn, err := Dial(`\\othercomp\pipe\mypipename`)
 func Dial(address string) (*PipeConn, error) {
 	for {
 		conn, err := dial(address, nmpwait_wait_forever)
