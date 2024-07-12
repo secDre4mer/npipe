@@ -10,9 +10,11 @@ package npipe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -70,28 +72,39 @@ const (
 var _ net.Conn = (*PipeConn)(nil)
 var _ net.Listener = (*PipeListener)(nil)
 
-// ErrClosed is the error returned by PipeListener.Accept when Close is called
-// on the PipeListener.
+// ErrClosed is the error returned by PipeListener.Accept (wrapped in a PipeError)
+// when Close is called on the PipeListener.
 var ErrClosed = net.ErrClosed
 
 // PipeError is an error related to a call to a pipe
 type PipeError struct {
-	msg     string
-	timeout bool
+	Op    string
+	Inner error
+}
+
+// Unwrap adds support for errors.Is and errors.As
+func (e PipeError) Unwrap() error {
+	return e.Inner
 }
 
 // Error implements the error interface
 func (e PipeError) Error() string {
-	return e.msg
+	return fmt.Sprintf("%s: %v", e.Op, e.Inner.Error())
 }
 
-// Timeout implements net.AddrError.Timeout()
+// Timeout implements net.Error.Timeout()
 func (e PipeError) Timeout() bool {
-	return e.timeout
+	if te, ok := e.Inner.(interface{ Timeout() bool }); ok {
+		return te.Timeout()
+	}
+	return false
 }
 
-// Temporary implements net.AddrError.Temporary()
+// Temporary implements net.Error.Temporary()
 func (e PipeError) Temporary() bool {
+	if te, ok := e.Inner.(interface{ Temporary() bool }); ok {
+		return te.Temporary()
+	}
 	return false
 }
 
@@ -135,17 +148,17 @@ func DialTimeout(address string, timeout time.Duration) (*PipeConn, error) {
 func DialContext(ctx context.Context, address string) (*PipeConn, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, &PipeError{Op: "dial", Inner: err}
 		}
 		conn, err := dial(address, 50)
 		if err == nil {
 			return conn, nil
 		}
-		if err == error_sem_timeout {
+		if errors.Is(err, error_sem_timeout) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, &PipeError{Op: "dial", Inner: err}
 		}
 		if isPipeNotReady(err) {
 			time.Sleep(50 * time.Millisecond)
@@ -162,7 +175,7 @@ func isPipeNotReady(err error) bool {
 	// File Not Found means the server hasn't created the pipe yet.
 	// Neither is a fatal error.
 
-	return err == syscall.ERROR_FILE_NOT_FOUND || err == error_pipe_busy
+	return errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) || errors.Is(err, error_pipe_busy)
 }
 
 // newOverlapped creates a structure used to track asynchronous
@@ -203,7 +216,7 @@ func waitForCompletion(withHandle func(func(h syscall.Handle)), overlapped *sysc
 // The timeout is only enforced if the pipe server has already created the pipe, otherwise
 // this function will return immediately.
 func dial(address string, timeout uint32) (*PipeConn, error) {
-	name, err := syscall.UTF16PtrFromString(string(address))
+	name, err := syscall.UTF16PtrFromString(address)
 	if err != nil {
 		return nil, err
 	}
@@ -213,11 +226,11 @@ func dial(address string, timeout uint32) (*PipeConn, error) {
 	// of the named pipe have been created yet.
 	// If this returns with no error, there is a pipe available.
 	if err := waitNamedPipe(name, timeout); err != nil {
-		if err == error_bad_pathname {
+		if errors.Is(err, error_bad_pathname) {
 			// badly formatted pipe name
-			return nil, badAddr(address)
+			return nil, badAddr("dial", address)
 		}
-		return nil, err
+		return nil, &PipeError{Inner: err}
 	}
 	pathp, err := syscall.UTF16PtrFromString(address)
 	if err != nil {
@@ -227,7 +240,7 @@ func dial(address string, timeout uint32) (*PipeConn, error) {
 		uint32(syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE), nil, syscall.OPEN_EXISTING,
 		syscall.FILE_FLAG_OVERLAPPED, 0)
 	if err != nil {
-		return nil, err
+		return nil, &PipeError{Op: "dial", Inner: err}
 	}
 	if trackHandles {
 		openHandlesMutex.Lock()
@@ -243,11 +256,11 @@ func dial(address string, timeout uint32) (*PipeConn, error) {
 // Listen will return a PipeError for an incorrectly formatted pipe name.
 func Listen(address string) (*PipeListener, error) {
 	handle, err := createPipe(address, true)
-	if err == error_invalid_name {
-		return nil, badAddr(address)
+	if errors.Is(err, error_invalid_name) {
+		return nil, badAddr("listen", address)
 	}
 	if err != nil {
-		return nil, err
+		return nil, &PipeError{Op: "listen", Inner: err}
 	}
 
 	return &PipeListener{
@@ -277,7 +290,7 @@ type PipeListener struct {
 // waits for the next call and returns a generic net.Conn.
 func (l *PipeListener) Accept() (net.Conn, error) {
 	c, err := l.AcceptPipe()
-	for err == error_no_data {
+	for errors.Is(err, error_no_data) {
 		// Ignore clients that connect and immediately disconnect.
 		c, err = l.AcceptPipe()
 	}
@@ -292,14 +305,17 @@ func (l *PipeListener) Accept() (net.Conn, error) {
 // the connection.
 func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 	if l == nil {
-		return nil, syscall.EINVAL
+		return nil, &PipeError{Op: "accept", Inner: syscall.EINVAL}
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.addr == "" || l.closed {
-		return nil, syscall.EINVAL
+	if l.addr == "" {
+		return nil, &PipeError{Op: "accept", Inner: syscall.EINVAL}
+	}
+	if l.closed {
+		return nil, &PipeError{Op: "accept", Inner: net.ErrClosed}
 	}
 
 	// the first time we call accept, the handle will have been created by the Listen
@@ -311,7 +327,7 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 		var err error
 		handle, err = createPipe(string(l.addr), false)
 		if err != nil {
-			return nil, err
+			return nil, &PipeError{Op: "accept", Inner: err}
 		}
 	} else {
 		l.handle = 0
@@ -319,15 +335,15 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 
 	overlapped, err := newOverlapped()
 	if err != nil {
-		return nil, err
+		return nil, &PipeError{Op: "accept", Inner: err}
 	}
 	defer closeHandle(overlapped.HEvent)
 	err = connectNamedPipe(handle, overlapped)
-	if err == nil || err == error_pipe_connected {
+	if err == nil || errors.Is(err, error_pipe_connected) {
 		return &PipeConn{handle: handle, addr: l.addr}, nil
 	}
 
-	if err == error_io_incomplete || err == syscall.ERROR_IO_PENDING {
+	if errors.Is(err, error_io_incomplete) || errors.Is(err, syscall.ERROR_IO_PENDING) {
 		l.acceptOverlapped = overlapped
 		l.acceptHandle = handle
 		// unlock here so close can function correctly while we wait,
@@ -346,12 +362,12 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 	if err != nil {
 		// Ensure we close the handle if we failed to accept the connection
 		_ = closeHandle(handle)
-		if err == syscall.ERROR_OPERATION_ABORTED {
+		if errors.Is(err, syscall.ERROR_OPERATION_ABORTED) {
 			// Return error compatible to net.Listener.Accept() in case the
 			// listener was closed.
-			return nil, net.ErrClosed
+			err = net.ErrClosed
 		}
-		return nil, err
+		return nil, &PipeError{Op: "accept", Inner: err}
 	}
 	// We forward the handle to the caller as a PipeConn. The caller is now responsible for closing it when done.
 	return &PipeConn{handle: handle, addr: l.addr}, nil
@@ -370,11 +386,11 @@ func (l *PipeListener) Close() error {
 	if l.handle != 0 {
 		err := disconnectNamedPipe(l.handle)
 		if err != nil {
-			return err
+			return &PipeError{Op: "close", Inner: err}
 		}
 		err = closeHandle(l.handle)
 		if err != nil {
-			return err
+			return &PipeError{Op: "close", Inner: err}
 		}
 		l.handle = 0
 	}
@@ -383,7 +399,7 @@ func (l *PipeListener) Close() error {
 		// to hold onto the mutex above.
 		// AcceptPipe is responsible for closing the handles of the pending IO, we don't need to do it here.
 		if err := cancelIoEx(l.acceptHandle, l.acceptOverlapped); err != nil {
-			return err
+			return &PipeError{Op: "close", Inner: err}
 		}
 	}
 	return nil
@@ -415,7 +431,7 @@ type iodata struct {
 // abort due to hitting the specified deadline. Deadline may be set to nil to wait forever. If no request is pending,
 // the content of iodata is returned.
 func (c *PipeConn) completeRequest(data iodata, deadline *time.Time, overlapped *syscall.Overlapped) (int, error) {
-	if data.err == error_io_incomplete || data.err == syscall.ERROR_IO_PENDING {
+	if errors.Is(data.err, error_io_incomplete) || errors.Is(data.err, syscall.ERROR_IO_PENDING) {
 		var timer <-chan time.Time
 		if deadline != nil {
 			if timeDiff := deadline.Sub(time.Now()); timeDiff > 0 {
@@ -437,15 +453,15 @@ func (c *PipeConn) completeRequest(data iodata, deadline *time.Time, overlapped 
 				if handle == 0 {
 					return
 				}
-				syscall.CancelIoEx(handle, overlapped)
+				_ = syscall.CancelIoEx(handle, overlapped)
 			})
-			data = iodata{0, timeout(c.addr.String())}
+			data = iodata{0, os.ErrDeadlineExceeded}
 		}
 	}
 	// Windows will produce ERROR_BROKEN_PIPE upon closing
 	// a handle on the other end of a connection. Go RPC
 	// expects an io.EOF error in this case.
-	if data.err == syscall.ERROR_BROKEN_PIPE {
+	if errors.Is(data.err, syscall.ERROR_BROKEN_PIPE) {
 		data.err = io.EOF
 	}
 	return int(data.n), data.err
@@ -463,7 +479,7 @@ func (c *PipeConn) Read(b []byte) (int, error) {
 	// contains a workaround that eats ERROR_BROKEN_PIPE.
 	overlapped, err := newOverlapped()
 	if err != nil {
-		return 0, err
+		return 0, &PipeError{Op: "read", Inner: err}
 	}
 	defer closeHandle(overlapped.HEvent)
 	var n uint32
@@ -474,14 +490,18 @@ func (c *PipeConn) Read(b []byte) (int, error) {
 		}
 		err = syscall.ReadFile(handle, b, &n, overlapped)
 	})
-	return c.completeRequest(iodata{n, err}, c.readDeadline, overlapped)
+	readBytes, err := c.completeRequest(iodata{n, err}, c.readDeadline, overlapped)
+	if err != nil {
+		err = &PipeError{Op: "read", Inner: err}
+	}
+	return readBytes, err
 }
 
 // Write implements the net.Conn Write method.
 func (c *PipeConn) Write(b []byte) (int, error) {
 	overlapped, err := newOverlapped()
 	if err != nil {
-		return 0, err
+		return 0, &PipeError{Op: "write", Inner: err}
 	}
 	defer closeHandle(overlapped.HEvent)
 	var n uint32
@@ -492,7 +512,11 @@ func (c *PipeConn) Write(b []byte) (int, error) {
 		}
 		err = syscall.WriteFile(handle, b, &n, overlapped)
 	})
-	return c.completeRequest(iodata{n, err}, c.writeDeadline, overlapped)
+	readBytes, err := c.completeRequest(iodata{n, err}, c.writeDeadline, overlapped)
+	if err != nil {
+		err = &PipeError{Op: "write", Inner: err}
+	}
+	return readBytes, err
 }
 
 // Close closes the connection.
@@ -507,7 +531,10 @@ func (c *PipeConn) Close() error {
 	err := closeHandle(c.handle)
 	// Set the handle to 0 to indicate that the connection is closed
 	c.handle = 0
-	return err
+	if err != nil {
+		return &PipeError{Op: "close", Inner: err}
+	}
+	return nil
 }
 
 // LocalAddr returns the local network address.
@@ -524,8 +551,8 @@ func (c *PipeConn) RemoteAddr() net.Addr {
 // SetDeadline implements the net.Conn SetDeadline method.
 // Note that timeouts are only supported on Windows Vista/Server 2008 and above
 func (c *PipeConn) SetDeadline(t time.Time) error {
-	c.SetReadDeadline(t)
-	c.SetWriteDeadline(t)
+	_ = c.SetReadDeadline(t)
+	_ = c.SetWriteDeadline(t)
 	return nil
 }
 
@@ -602,9 +629,6 @@ var (
 	openHandlesMutex sync.Mutex
 )
 
-func badAddr(addr string) PipeError {
-	return PipeError{fmt.Sprintf("Invalid pipe address '%s'.", addr), false}
-}
-func timeout(addr string) PipeError {
-	return PipeError{fmt.Sprintf("Pipe IO timed out waiting for '%s'", addr), true}
+func badAddr(op string, addr string) PipeError {
+	return PipeError{Op: op, Inner: fmt.Errorf("invalid pipe address '%s'", addr)}
 }
