@@ -491,7 +491,7 @@ func (c *PipeConn) Read(b []byte) (int, error) {
 		err = syscall.ReadFile(handle, b, &n, overlapped)
 	})
 	readBytes, err := c.completeRequest(iodata{n, err}, c.readDeadline, overlapped)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) { // EOF should not be wrapped because e.g. io.ReadAll relies on it not being wrapped
 		err = &PipeError{Op: "read", Inner: err}
 	}
 	return readBytes, err
